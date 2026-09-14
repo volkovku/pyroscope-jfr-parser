@@ -5,7 +5,7 @@ go 1.25.0
 toolchain go1.26.5
 
 require (
-	github.com/google/pprof v0.0.0-20260507013755-92041b743c96
+	github.com/grafana/jfr-parser/pprof v0.0.7
 	github.com/grafana/pyroscope/api v1.5.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/text v0.37.0
@@ -21,3 +21,6 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/grafana/jfr-parser/pprof => ./pprof
+replace github.com/grafana/jfr-parser/parser => ./parser

@@ -3,7 +3,6 @@ package pprof
 import (
 	"fmt"
 	"io"
-	"regexp"
 
 	"github.com/grafana/jfr-parser/parser"
 )
@@ -11,7 +10,6 @@ import (
 type pprofOptions struct {
 	truncatedFrame       bool
 	disablePanicRecovery bool
-	thread               ThreadInfoOptions
 }
 type Option func(*pprofOptions)
 
@@ -25,49 +23,6 @@ func WithDisablePanicRecovery(v bool) Option {
 	return func(o *pprofOptions) {
 		o.disablePanicRecovery = v
 	}
-}
-
-// ThreadInfoOptions controls how the sampled thread of each execution sample is
-// surfaced. Requires per-thread sampling (async-profiler -t). All fields optional:
-// Frame renders the thread name as a root frame; LabelKey adds a sample label
-// under that key; Transform maps the raw thread name to the value used for both
-// (e.g. collapsing to a pool name), returning "" to omit and nil to use the raw name.
-type ThreadInfoOptions struct {
-	Frame     bool
-	LabelKey  string
-	Transform func(threadName string) string
-}
-
-// WithThreadInfo surfaces the sampled thread as a root frame and/or a sample
-// label, applying a shared name transform to both. Off by default.
-func WithThreadInfo(t ThreadInfoOptions) Option {
-	return func(o *pprofOptions) {
-		o.thread = t
-	}
-}
-
-func (t ThreadInfoOptions) enabled() bool {
-	return t.Frame || t.LabelKey != ""
-}
-
-// RegexThreadTransform builds a ThreadInfoOptions.Transform that maps a thread
-// name to the first capture group of expr (e.g. a pool name), falling back to
-// the original name when it does not match so unrelated threads stay distinct.
-// It fails if expr does not compile or has no capture group.
-func RegexThreadTransform(expr string) (func(threadName string) string, error) {
-	re, err := regexp.Compile(expr)
-	if err != nil {
-		return nil, err
-	}
-	if re.NumSubexp() < 1 {
-		return nil, fmt.Errorf("thread name regex %q has no capture group", expr)
-	}
-	return func(threadName string) string {
-		if m := re.FindStringSubmatch(threadName); len(m) > 1 && m[1] != "" {
-			return m[1]
-		}
-		return threadName
-	}, nil
 }
 
 func ParseJFR(body []byte, pi *ParseInput, jfrLabels *LabelsSnapshot, opts ...Option) (res *Profiles, err error) {
@@ -100,24 +55,6 @@ func parse(parser *parser.Parser, piOriginal *ParseInput, jfrLabels *LabelsSnaps
 
 	var values = [2]int64{1, 0}
 
-	// Transform is called per distinct thread name rather than per sample, since
-	// there are far fewer threads than samples and it may allocate.
-	var threadNameCache map[string]string
-	transformThreadName := func(name string) string {
-		if opt.thread.Transform == nil {
-			return name
-		}
-		if v, ok := threadNameCache[name]; ok {
-			return v
-		}
-		v := opt.thread.Transform(name)
-		if threadNameCache == nil {
-			threadNameCache = map[string]string{}
-		}
-		threadNameCache[name] = v
-		return v
-	}
-
 	for {
 		typ, err := parser.ParseEvent()
 		if err != nil {
@@ -136,29 +73,11 @@ func parse(parser *parser.Parser, piOriginal *ParseInput, jfrLabels *LabelsSnaps
 				TraceIdHi: parser.ExecutionSample.TraceIdHi,
 				TraceIdLo: parser.ExecutionSample.TraceIdLo,
 			}
-			if opt.thread.enabled() {
-				if t := parser.GetThread(parser.ExecutionSample.SampledThread); t != nil {
-					name := t.JavaName
-					if name == "" {
-						name = t.OsName // native threads (GC, JIT compiler, VM tasks, etc)
-					}
-					name = transformThreadName(name)
-					if name != "" {
-						if opt.thread.Frame {
-							correlation.ThreadName = name
-						}
-						if opt.thread.LabelKey != "" {
-							correlation.ThreadLabelKey = opt.thread.LabelKey
-							correlation.ThreadLabelValue = name
-						}
-					}
-				}
-			}
 			if ts != nil && ts.Name != "STATE_SLEEPING" {
-				builders.addStacktrace(sampleTypeCPU, correlation, parser.ExecutionSample.StackTrace, values[:1])
+				builders.addStacktrace(sampleTypeCPU, correlation, parser.ExecutionSample.StackTrace, values[:1], 0)
 			}
 			if event == "wall" {
-				builders.addStacktrace(sampleTypeWall, correlation, parser.ExecutionSample.StackTrace, values[:1])
+				builders.addStacktrace(sampleTypeWall, correlation, parser.ExecutionSample.StackTrace, values[:1], 0)
 			}
 		case parser.TypeMap.T_WALL_CLOCK_SAMPLE:
 			values[0] = int64(parser.WallClockSample.Samples)
@@ -171,9 +90,9 @@ func parse(parser *parser.Parser, piOriginal *ParseInput, jfrLabels *LabelsSnaps
 			}
 			ts := parser.GetThreadState(parser.WallClockSample.State)
 			if ts != nil && ts.Name == "STATE_RUNNABLE" && event == "wall" {
-				builders.addStacktrace(sampleTypeCPU, correlation, parser.WallClockSample.StackTrace, values[:1])
+				builders.addStacktrace(sampleTypeCPU, correlation, parser.WallClockSample.StackTrace, values[:1], 0)
 			}
-			builders.addStacktrace(sampleTypeWall, correlation, parser.WallClockSample.StackTrace, values[:1])
+			builders.addStacktrace(sampleTypeWall, correlation, parser.WallClockSample.StackTrace, values[:1], 0)
 		case parser.TypeMap.T_ALLOC_IN_NEW_TLAB:
 			values[1] = int64(parser.ObjectAllocationInNewTLAB.TlabSize)
 			correlation := StacktraceCorrelation{
@@ -183,7 +102,7 @@ func parse(parser *parser.Parser, piOriginal *ParseInput, jfrLabels *LabelsSnaps
 				TraceIdHi: parser.ObjectAllocationInNewTLAB.TraceIdHi,
 				TraceIdLo: parser.ObjectAllocationInNewTLAB.TraceIdLo,
 			}
-			builders.addStacktrace(sampleTypeInTLAB, correlation, parser.ObjectAllocationInNewTLAB.StackTrace, values[:2])
+			builders.addStacktrace(sampleTypeInTLAB, correlation, parser.ObjectAllocationInNewTLAB.StackTrace, values[:2], parser.ObjectAllocationInNewTLAB.ObjectClass)
 		case parser.TypeMap.T_ALLOC_OUTSIDE_TLAB:
 			values[1] = int64(parser.ObjectAllocationOutsideTLAB.AllocationSize)
 			correlation := StacktraceCorrelation{
@@ -193,10 +112,10 @@ func parse(parser *parser.Parser, piOriginal *ParseInput, jfrLabels *LabelsSnaps
 				TraceIdHi: parser.ObjectAllocationOutsideTLAB.TraceIdHi,
 				TraceIdLo: parser.ObjectAllocationOutsideTLAB.TraceIdLo,
 			}
-			builders.addStacktrace(sampleTypeOutTLAB, correlation, parser.ObjectAllocationOutsideTLAB.StackTrace, values[:2])
+			builders.addStacktrace(sampleTypeOutTLAB, correlation, parser.ObjectAllocationOutsideTLAB.StackTrace, values[:2], parser.ObjectAllocationOutsideTLAB.ObjectClass)
 		case parser.TypeMap.T_ALLOC_SAMPLE:
 			values[1] = int64(parser.ObjectAllocationSample.Weight)
-			builders.addStacktrace(sampleTypeAllocSample, StacktraceCorrelation{}, parser.ObjectAllocationSample.StackTrace, values[:2])
+			builders.addStacktrace(sampleTypeAllocSample, StacktraceCorrelation{}, parser.ObjectAllocationSample.StackTrace, values[:2], parser.ObjectAllocationSample.ObjectClass)
 		case parser.TypeMap.T_MONITOR_ENTER:
 			values[1] = int64(parser.JavaMonitorEnter.Duration)
 			correlation := StacktraceCorrelation{
@@ -206,15 +125,15 @@ func parse(parser *parser.Parser, piOriginal *ParseInput, jfrLabels *LabelsSnaps
 				TraceIdHi: parser.JavaMonitorEnter.TraceIdHi,
 				TraceIdLo: parser.JavaMonitorEnter.TraceIdLo,
 			}
-			builders.addStacktrace(sampleTypeLock, correlation, parser.JavaMonitorEnter.StackTrace, values[:2])
+			builders.addStacktrace(sampleTypeLock, correlation, parser.JavaMonitorEnter.StackTrace, values[:2], 0)
 		case parser.TypeMap.T_THREAD_PARK:
 			values[1] = int64(parser.ThreadPark.Duration)
-			builders.addStacktrace(sampleTypeThreadPark, StacktraceCorrelation{}, parser.ThreadPark.StackTrace, values[:2])
+			builders.addStacktrace(sampleTypeThreadPark, StacktraceCorrelation{}, parser.ThreadPark.StackTrace, values[:2], 0)
 		case parser.TypeMap.T_LIVE_OBJECT:
-			builders.addStacktrace(sampleTypeLiveObject, StacktraceCorrelation{}, parser.LiveObject.StackTrace, values[:1])
+			builders.addStacktrace(sampleTypeLiveObject, StacktraceCorrelation{}, parser.LiveObject.StackTrace, values[:1], 0)
 		case parser.TypeMap.T_MALLOC:
 			values[1] = int64(parser.Malloc.Size)
-			builders.addStacktrace(sampleTypeMalloc, StacktraceCorrelation{}, parser.Malloc.StackTrace, values[:2])
+			builders.addStacktrace(sampleTypeMalloc, StacktraceCorrelation{}, parser.Malloc.StackTrace, values[:2], 0)
 		case parser.TypeMap.T_ACTIVE_SETTING:
 			if parser.ActiveSetting.Name == "event" {
 				event = parser.ActiveSetting.Value
