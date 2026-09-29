@@ -76,7 +76,7 @@ func javaMajorVersion(specificationVersion string) string {
 	return version
 }
 
-func (b *jfrPprofBuilders) addStacktrace(sampleType int64, correlation StacktraceCorrelation, ref types.StackTraceRef, values []int64) {
+func (b *jfrPprofBuilders) addStacktrace(sampleType int64, correlation StacktraceCorrelation, ref types.StackTraceRef, values []int64, classRef types.ClassRef) {
 	p := b.profileBuilderForSampleType(sampleType)
 	st := b.parser.GetStacktrace(ref)
 	if st == nil {
@@ -94,17 +94,35 @@ func (b *jfrPprofBuilders) addStacktrace(sampleType int64, correlation Stacktrac
 		}
 	}
 
-	sample := p.FindExternalSampleWithCorrelation(uint64(ref), correlation)
+	// Combine stackTraceRef + classRef into a unique locationsID so that the same
+	// call stack allocating different types produces separate pprof samples.
+	locationsID := uint64(ref)
+	if classRef != 0 {
+		locationsID ^= uint64(classRef) * 0x9e3779b97f4a7c15
+	}
+
+	sample := p.FindExternalSampleWithCorrelation(locationsID, correlation)
 	if sample != nil {
 		addValues(sample.Value)
 		return
 	}
 
 	nLocs := len(st.Frames)
+	if classRef != 0 {
+		nLocs++
+	}
 	if b.opt.truncatedFrame && st.Truncated {
-		nLocs += 1
+		nLocs++
 	}
 	locations := make([]uint64, 0, nLocs)
+
+	// Prepend the allocated class as the innermost (leaf) frame.
+	if classRef != 0 {
+		if classLocID := b.classLocation(p, classRef); classLocID != 0 {
+			locations = append(locations, uint64(classLocID))
+		}
+	}
+
 	for i := 0; i < len(st.Frames); i++ {
 		f := st.Frames[i]
 		extLocID := ExternalLocationID{
@@ -147,7 +165,77 @@ func (b *jfrPprofBuilders) addStacktrace(sampleType int64, correlation Stacktrac
 	}
 	vs := make([]int64, len(values))
 	addValues(vs)
-	p.AddExternalSampleWithLabels(locations, vs, b.contextLabels(correlation.ContextId), b.jfrLabels, uint64(ref), correlation)
+	p.AddExternalSampleWithLabels(locations, vs, b.contextLabels(correlation.ContextId), b.jfrLabels, locationsID, correlation)
+}
+
+// classLocation returns (or creates) a pprof location for the allocated class frame.
+// Bit 63 is set in the ExternalFunctionID namespace to avoid collisions with method IDs.
+func (b *jfrPprofBuilders) classLocation(p *ProfileBuilder, classRef types.ClassRef) PPROFLocationID {
+	extFuncID := ExternalFunctionID(uint64(classRef) | (uint64(1) << 63))
+	extLocID := ExternalLocationID{ExternalFunctionID: extFuncID, Line: 0}
+
+	loc, found := p.FindLocationByExternalID(extLocID)
+	if found {
+		return loc
+	}
+
+	pprofFuncID, found := p.FindFunctionByExternalID(extFuncID)
+	if !found {
+		cls := b.parser.GetClass(classRef)
+		if cls == nil {
+			return 0
+		}
+		className := jvmClassToName(b.parser.GetSymbolString(cls.Name))
+		pprofFuncID = p.AddExternalFunction(className, extFuncID)
+	}
+	return p.AddExternalLocation(extLocID, pprofFuncID)
+}
+
+// jvmClassToName converts a JVM internal class name (as stored in JFR symbols)
+// to a human-readable Java class name, handling array descriptors.
+// Examples: "java/lang/String" → "java.lang.String"
+//
+//	"[Ljava/lang/String;" → "java.lang.String[]"
+//	"[I"                  → "int[]"
+func jvmClassToName(symbol string) string {
+	arrayDepth := 0
+	for arrayDepth < len(symbol) && symbol[arrayDepth] == '[' {
+		arrayDepth++
+	}
+
+	base := symbol[arrayDepth:]
+	var name string
+
+	if arrayDepth > 0 {
+		switch base {
+		case "B":
+			name = "byte"
+		case "C":
+			name = "char"
+		case "S":
+			name = "short"
+		case "I":
+			name = "int"
+		case "J":
+			name = "long"
+		case "Z":
+			name = "boolean"
+		case "F":
+			name = "float"
+		case "D":
+			name = "double"
+		default:
+			if len(base) > 2 && base[0] == 'L' && base[len(base)-1] == ';' {
+				name = strings.ReplaceAll(base[1:len(base)-1], "/", ".")
+			} else {
+				name = strings.ReplaceAll(base, "/", ".")
+			}
+		}
+	} else {
+		name = strings.ReplaceAll(base, "/", ".")
+	}
+
+	return name + strings.Repeat("[]", arrayDepth)
 }
 
 func (b *jfrPprofBuilders) profileBuilderForSampleType(sampleType int64) *ProfileBuilder {

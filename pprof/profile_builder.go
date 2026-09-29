@@ -39,7 +39,7 @@ func NewProfileBuilderWithLabels(ts int64) *ProfileBuilder {
 	return p
 }
 
-type ExternalFunctionID uint32
+type ExternalFunctionID uint64
 type ExternalLocationID struct {
 	ExternalFunctionID ExternalFunctionID
 	Line               uint32
