@@ -9,4 +9,4 @@ generate-types:
 .PHONY: test
 test:
 	$(GO) test $(GO_FLAGS) $(shell $(GO) list ./...)
-
+	cd pprof && $(GO) test $(GO_FLAGS) ./...
